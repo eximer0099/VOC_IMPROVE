@@ -1,0 +1,18 @@
+[project]
+name = "12-voc-improve"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=0.116,<1",
+    "grpcio>=1.82,<2",
+    "mcp>=1.28,<2",
+    "openai>=2.45,<3",
+    "protobuf>=6.33,<7",
+    "python-dotenv>=1.2,<2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
