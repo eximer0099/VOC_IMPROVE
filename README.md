@@ -19,6 +19,56 @@ The analysis pipeline contains six agents:
 5. **Critic** reviews the selected output for quality problems.
 6. **Improver** generates a policy improvement proposal.
 
+The Interpreter is parsing-only and does not call downstream agents. After its
+intent is returned, the processing chain runs once in the fixed order
+`Retriever -> Summarizer -> Evaluator -> Critic -> Improver`. Summarizer owns
+this downstream orchestration; no other agent calls backward or restarts the
+chain.
+
+Interpreter detects very short or generic questions before the downstream
+pipeline starts. It performs a read-only lookup against the configured VOC CSV:
+when matching history exists, the intent is enriched with search terms and up
+to three records are retained as `history_evidence`. If no useful history can
+establish the topic, Interpreter returns `needs_clarification=true` with a
+`clarifying_question`; the orchestrator pauses without calling Summarizer or
+later agents. These fields are included in `intent_json` for auditability.
+
+Interpreter and Retriever share deterministic Korean search preprocessing.
+Common misspellings and conversational forms (for example, `됫` → `됐`,
+`안보여요` → `보이지 않아요`, and `먹통` → `작동하지 않음`) are normalized
+without changing stored VOC data or user input. Retriever compares normalized
+CSV text against both the normalized phrase and meaningful token expansions;
+the auditable replacement dictionary is in `utils/text_normalization.py`.
+
+When Critic requests summary refinement, Summarizer applies the edits and sends
+the previous edit list together with the revised summary to Critic for one
+conditional revalidation. The result is recorded as `feedback_applied` and any
+unresolved instructions as `remaining_edits`. Improver runs only after the
+feedback check. If some feedback cannot be applied without inventing facts,
+Summarizer records `continued_with_grounded_summary=true` and passes the last
+grounded summary to Improver instead of stopping the pipeline. Critic is also
+instructed not to request dates, channels, figures, causes, or other details
+absent from the cited VOC. This check does not restart Retriever, Summarizer,
+or Evaluator.
+
+After the pipeline completes, the orchestrator applies an intent-topic
+guardrail for natural-language requests. It normalizes the Interpreter's
+`intent_json` filters and verifies that at least one intent topic term occurs
+in the final summary or policy. It also checks that the output required by the
+interpreted task (`summary`, `policy`, or `both`) is present. The diagnostic is
+returned in `intent_guardrail_json`. A mismatch clears the off-topic summary
+and policy, appends `intent_topic_guardrail_failed` to the trace, and returns
+`ok=false`.
+
+Summarizer uses extractive grounding. Every candidate must include an exact
+source citation in the form
+`summary | 근거: [VOCn] complete original VOC text`. After generation, the
+candidate, citation index, quoted evidence, and summary excerpt are compared
+with the Retriever output. A candidate that changes or invents source content
+is replaced with a safe verbatim excerpt before Evaluator receives it. Refined
+summaries pass the same check; when source text is unavailable, refinement is
+skipped instead of allowing an unverified claim.
+
 The services listen on ports `6001` through `6006` by default. `grpc_server.py`
 orchestrates calls between them, while `main.py` exposes the pipeline through an
 MCP stdio server.

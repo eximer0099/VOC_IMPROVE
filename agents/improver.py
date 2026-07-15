@@ -93,6 +93,9 @@ class PolicyImproverAgent:
         # 요약이 비어있거나 너무 짧으면 정책 생성이 어렵습니다
         summary = (summary or "").strip()
         agent_event("Improver", "improve", summary_length=len(summary))
+        agent_file_event(
+            "Improver", "input", operation="improve", summary=summary
+        )
         if not summary or len(summary) < 10:
             return PolicyResult(
                 policy="요약 내용이 비어 있거나 충분하지 않아 구체적인 정책 개선안을 제안하기 어렵습니다. "

@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import grpc
 
@@ -58,14 +58,24 @@ class FaultToleranceTests(unittest.TestCase):
         agent = RetrieverAgent()
         stderr = io.StringIO()
 
-        with redirect_stderr(stderr):
-            result = asyncio.run(
-                agent.run(
-                    str(Path(__file__).resolve().parents[1] / "voc.csv"),
-                    filters=["존재하지않는검색어-987654321"],
-                    max_items=30,
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "voc.csv"
+            csv_path.write_text("고객ID,불만내용\nCUST001,배송 지연\n", encoding="utf-8")
+            with (
+                redirect_stderr(stderr),
+                patch.object(
+                    agent,
+                    "_append_missing_input",
+                    new=AsyncMock(return_value=""),
+                ),
+            ):
+                result = asyncio.run(
+                    agent.run(
+                        str(csv_path),
+                        filters=["__NO_MATCH_FAULT_TEST_7F3A91C2__"],
+                        max_items=30,
+                    )
                 )
-            )
 
         self.assertEqual(result, [])
         events = [

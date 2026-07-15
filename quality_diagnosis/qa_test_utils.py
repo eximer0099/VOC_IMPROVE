@@ -22,8 +22,9 @@ def build_judge_cases_from_agent_log(
 ) -> list[dict[str, Any]]:
     """agent.log의 순차 이벤트를 question/candidates/policy 케이스로 매핑한다.
 
-    각 Interpreter input 이후 처음 나타나는 Summarizer make_candidates와
-    그 뒤의 Improver improve를 한 케이스로 묶는다. 동일 policy가 다시 기록되는
+    각 Interpreter input부터 다음 Interpreter input 직전까지 처음 나타나는
+    Summarizer make_candidates와 Improver improve를 한 케이스로 묶는다.
+    둘 중 나타나지 않은 값은 JSON null로 기록한다. 동일 policy가 다시 기록되는
     ``rpc: Improve`` 이벤트는 ``operation: improve``가 아니므로 자동 제외된다.
     """
     if case_count <= 0:
@@ -32,6 +33,24 @@ def build_judge_cases_from_agent_log(
     cases: list[dict[str, Any]] = []
     question: str | None = None
     candidates: dict[str, Any] | None = None
+    policy: str | None = None
+
+    def finalize_current_case() -> bool:
+        """현재 질문을 누락 필드는 None(JSON null)으로 채워 확정한다."""
+        nonlocal question, candidates, policy
+        if question is None or len(cases) >= case_count:
+            return len(cases) >= case_count
+        cases.append(
+            {
+                "question": question,
+                "candidates": candidates,
+                "policy": policy,
+            }
+        )
+        question = None
+        candidates = None
+        policy = None
+        return len(cases) >= case_count
 
     with log_path.open(encoding="utf-8-sig") as log_file:
         for line_number, line in enumerate(log_file, start=1):
@@ -49,8 +68,11 @@ def build_judge_cases_from_agent_log(
                 and event.get("action") == "input"
                 and event.get("question")
             ):
+                if finalize_current_case():
+                    break
                 question = str(event["question"])
                 candidates = None
+                policy = None
                 continue
 
             if (
@@ -66,23 +88,16 @@ def build_judge_cases_from_agent_log(
 
             if (
                 question is not None
-                and candidates is not None
+                and policy is None
                 and event.get("agent") == "Improver"
                 and event.get("action") == "output"
                 and event.get("operation") == "improve"
                 and event.get("policy")
             ):
-                cases.append(
-                    {
-                        "question": question,
-                        "candidates": candidates,
-                        "policy": str(event["policy"]),
-                    }
-                )
-                question = None
-                candidates = None
-                if len(cases) == case_count:
-                    break
+                policy = str(event["policy"])
+
+    if len(cases) < case_count:
+        finalize_current_case()
 
     if len(cases) != case_count:
         raise ValueError(
@@ -116,7 +131,7 @@ def cases_to_markdown(cases: list[dict[str, Any]]) -> str:
         missing = {"question", "candidates", "policy"} - case.keys()
         if missing:
             raise ValueError(f"{index}번 케이스에 항목이 없습니다: {sorted(missing)}")
-        if not isinstance(case["candidates"], dict):
+        if case["candidates"] is not None and not isinstance(case["candidates"], dict):
             raise ValueError(f"{index}번 케이스의 candidates는 객체여야 합니다.")
 
         lines.extend(
@@ -131,10 +146,17 @@ def cases_to_markdown(cases: list[dict[str, Any]]) -> str:
                 "",
             ]
         )
-        for name, candidate in case["candidates"].items():
-            lines.append(f"- **{name}**: {str(candidate).strip()}")
+        if case["candidates"] is None:
+            lines.append("NULL")
+        else:
+            for name, candidate in case["candidates"].items():
+                lines.append(f"- **{name}**: {str(candidate).strip()}")
 
-        policy = _shift_policy_headings(str(case["policy"]))
+        policy = (
+            "NULL"
+            if case["policy"] is None
+            else _shift_policy_headings(str(case["policy"]))
+        )
         lines.extend(["", "### Policy", "", policy, "", "---", ""])
 
     return "\n".join(lines).rstrip() + "\n"

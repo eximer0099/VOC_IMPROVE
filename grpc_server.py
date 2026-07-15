@@ -11,6 +11,7 @@ import asyncio
 import os
 # JSON 데이터 직렬화/역직렬화
 import json
+import re
 # 타입 힌트를 위한 타입 정의들
 from typing import Dict, Any, Optional, List
 # gRPC 라이브러리 (비동기 클라이언트/서버 통신)
@@ -69,6 +70,93 @@ class VOCGRPCRuntime:
     def __init__(self):
         # 각 에이전트는 모듈 상단의 INTERPRETER_ENDPOINT, SUMMARIZER_ENDPOINT 등 환경 변수 기반 상수를 사용합니다
         pass
+
+    @staticmethod
+    def _normalize_topic_text(value: str) -> str:
+        """Normalize text for a deterministic intent/topic comparison."""
+        return re.sub(r"[^0-9a-zA-Z가-힣]+", " ", str(value).lower()).strip()
+
+    @classmethod
+    def validate_intent_topic(
+        cls, intent: Dict[str, Any], summary: str, policy: str
+    ) -> Dict[str, Any]:
+        """Check that the final response still covers the Interpreter intent."""
+        task = str(intent.get("task") or "both").lower()
+        normalized_summary = cls._normalize_topic_text(summary)
+        normalized_policy = cls._normalize_topic_text(policy)
+        final_text = f"{normalized_summary} {normalized_policy}".strip()
+
+        filters = [
+            cls._normalize_topic_text(item)
+            for item in (intent.get("filters") or [])
+            if cls._normalize_topic_text(item)
+        ]
+        topic_terms = []
+        for value in filters:
+            topic_terms.append(value)
+            topic_terms.extend(token for token in value.split() if len(token) >= 2)
+        topic_terms = list(dict.fromkeys(topic_terms))
+        matched_terms = [term for term in topic_terms if term in final_text]
+
+        missing_outputs = []
+        if task in {"summary", "both"} and not normalized_summary:
+            missing_outputs.append("summary")
+        if task in {"policy", "both"} and not normalized_policy:
+            missing_outputs.append("policy")
+
+        reasons = []
+        if not topic_terms:
+            reasons.append("intent에 검증 가능한 주제어가 없습니다.")
+        elif not matched_terms:
+            reasons.append("최종 응답에서 intent 주제어를 찾을 수 없습니다.")
+        if missing_outputs:
+            reasons.append(
+                "요청 task에 필요한 출력이 없습니다: " + ", ".join(missing_outputs)
+            )
+
+        return {
+            "passed": not reasons,
+            "task": task,
+            "topic_terms": topic_terms,
+            "matched_terms": matched_terms,
+            "missing_outputs": missing_outputs,
+            "reasons": reasons,
+        }
+
+    @classmethod
+    def _apply_intent_topic_guardrail(
+        cls, intent: Dict[str, Any], result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Block a successful response when its topic diverges from intent."""
+        guardrail = cls.validate_intent_topic(
+            intent, result.get("summary", ""), result.get("policy", "")
+        )
+        result["intent_guardrail_json"] = json.dumps(guardrail, ensure_ascii=False)
+        if not result.get("ok") or guardrail["passed"]:
+            return result
+
+        message = "Intent 주제 일치 가드레일 실패: " + " ".join(
+            guardrail["reasons"]
+        )
+        agent_event("Orchestrator", "intent_topic_guardrail_failed", **guardrail)
+        result.update(
+            {
+                "ok": False,
+                "summary": "",
+                "policy": "",
+                "message": message,
+                "error": message,
+                "trace": "; ".join(
+                    part
+                    for part in (
+                        result.get("trace", ""),
+                        "intent_topic_guardrail_failed",
+                    )
+                    if part
+                ),
+            }
+        )
+        return result
 
     async def _check_retriever(self, timeout: float) -> Optional[Dict[str, Any]]:
         """Return a clear failure result when the Retriever service is down."""
@@ -156,9 +244,39 @@ class VOCGRPCRuntime:
             "task":      res.task or "both",           # 작업 유형: "summary", "policy", "both"
             "filters":   list(res.filters),            # 필터 키워드 리스트
             "max_items": res.max_items or 30,          # 최대 분석 항목 수 (기본값: 30)
-            "csv_path":  res.csv_path or final_csv   # 최종 CSV 경로 (interpreter가 준 값 우선)
+            "csv_path":  res.csv_path or final_csv,  # 최종 CSV 경로 (interpreter가 준 값 우선)
+            "needs_clarification": res.needs_clarification,
+            "clarifying_question": res.clarifying_question or "",
+            "intent_enriched": res.intent_enriched,
+            "history_evidence": list(res.history_evidence),
         }
         agent_event("Orchestrator", "intent_received", **intent)
+
+        if intent["needs_clarification"]:
+            message = intent["clarifying_question"]
+            agent_event(
+                "Orchestrator", "pipeline_paused_for_clarification", message=message
+            )
+            return {
+                "ok": False,
+                "summary": "",
+                "policy": "",
+                "intent_json": json.dumps(intent, ensure_ascii=False),
+                "eval_json": "{}",
+                "summary_critic_json": "{}",
+                "intent_guardrail_json": json.dumps(
+                    {
+                        "passed": False,
+                        "status": "clarification_required",
+                        "reasons": ["질의가 모호하고 보강할 유사 VOC 이력이 없습니다."],
+                    },
+                    ensure_ascii=False,
+                ),
+                "trace": "clarification_required",
+                "message": message,
+                "clarifying_question": message,
+                "error": "clarification_required",
+            }
 
         # ============ Summarizer RunPipeline 직접 호출 ============
         # Interpreter에서 파싱된 intent를 사용하여 Summarizer의 RunPipeline을 호출합니다
@@ -180,7 +298,7 @@ class VOCGRPCRuntime:
 
         agent_event("Orchestrator", "pipeline_completed", ok=sres.ok,
                     summary_length=len(sres.summary), policy_length=len(sres.policy))
-        return {
+        result = {
             "ok": sres.ok,
             "summary": sres.summary or "",
             "policy": sres.policy or "",
@@ -190,6 +308,7 @@ class VOCGRPCRuntime:
             "trace": sres.trace or "",
             "message": "Pipeline completed via agent-to-agent calls",
         }
+        return self._apply_intent_topic_guardrail(intent, result)
 
     # ============ 파라미터 기반 실행 메서드 ============
     # 자연어 질의 없이 직접 파라미터를 지정하여 VOC 분석을 수행합니다

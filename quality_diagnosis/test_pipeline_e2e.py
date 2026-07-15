@@ -24,8 +24,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from openai import AsyncOpenAI
+import grpc
 
 import grpc_server
+import voc_pb2_grpc
+from agents.critic import CriticResult, CriticServicer
+from agents.evaluator import EvaluatorAgent, EvaluatorServicer
+from agents.improver import ImproverServicer, PolicyResult
+from agents.interpreter import InterpreterServicer, NLIntent
+from agents.retriever import RetrieverServicer
+from agents.summarizer import SummarizerAgent, SummarizerServicer
 from utils.settings import MODEL_SUMMARY
 
 
@@ -46,6 +54,17 @@ EXPECTED_AGENT_ORDER = [
     "Critic",
     "Improver",
 ]
+
+
+async def start_service(register, servicer):
+    """Start one in-process gRPC service on an ephemeral local port."""
+    server = grpc.aio.server()
+    register(servicer, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    if not port:
+        raise RuntimeError("failed to allocate an ephemeral gRPC port")
+    await server.start()
+    return server, f"127.0.0.1:{port}"
 
 
 def load_test_cases() -> list[dict]:
@@ -309,6 +328,58 @@ def write_quality_score_report(scored_cases: list[dict]) -> None:
 
 
 class PipelineEndToEndTests(unittest.TestCase):
+    def test_clarification_is_a_valid_interpreter_only_e2e_result(self) -> None:
+        """Ambiguous input should stop cleanly without requiring Improver."""
+        test_case = next(
+            case for case in load_test_cases() if case.get("case_id") == "TC-09"
+        )
+
+        class ClarificationRuntime:
+            async def run_with_question(self, question, csv_path, timeout):
+                intent = {
+                    "task": "both",
+                    "filters": [],
+                    "max_items": 30,
+                    "csv_path": csv_path,
+                    "needs_clarification": True,
+                    "clarifying_question": "어떤 앱 기능에서 문제가 발생했나요?",
+                    "intent_enriched": False,
+                    "history_evidence": [],
+                }
+                return {
+                    "ok": False,
+                    "intent_json": json.dumps(intent, ensure_ascii=False),
+                    "clarifying_question": intent["clarifying_question"],
+                    "message": intent["clarifying_question"],
+                    "error": "clarification_required",
+                }
+
+        with patch.object(grpc_server, "VOCGRPCRuntime", ClarificationRuntime):
+            execution = asyncio.run(self._run_pipeline(test_case))
+
+        self.assertEqual(execution["agent_call_order"], ["Interpreter"])
+        self.assertEqual(
+            execution["final_result"]["error"], "clarification_required"
+        )
+
+    def test_critic_is_followed_by_improver_in_local_e2e(self) -> None:
+        """The deterministic local pipeline must execute Improver after Critic."""
+        test_case = load_test_cases()[0]
+
+        execution = asyncio.run(self._legacy_fake_pipeline(test_case))
+
+        calls = execution["agent_call_order"]
+        critic_index = max(
+            index for index, agent in enumerate(calls) if agent == "Critic"
+        )
+        improver_index = next(
+            index
+            for index, agent in enumerate(calls)
+            if agent == "Improver" and index > critic_index
+        )
+        self.assertEqual(improver_index, critic_index + 1)
+        self.assertTrue(execution["final_result"]["policy"])
+
     def test_question_flows_through_grpc_server_and_all_six_agents(self) -> None:
         executions = []
         for test_case in load_test_cases():
@@ -447,7 +518,6 @@ class PipelineEndToEndTests(unittest.TestCase):
             retriever_endpoint, evaluator_endpoint, critic_endpoint, improver_endpoint = (
                 endpoints
             )
-            interpreter.agent.retriever_endpoint = retriever_endpoint
             summarizer_logic.retriever_endpoint = retriever_endpoint
             summarizer_logic.evaluator_endpoint = evaluator_endpoint
             summarizer_logic.critic_endpoint = critic_endpoint
@@ -488,25 +558,15 @@ class PipelineEndToEndTests(unittest.TestCase):
                     "filters": ["배송", "지연"],
                     "max_items": 20,
                     "csv_path": CSV_PATH,
+                    "needs_clarification": False,
+                    "clarifying_question": "",
+                    "intent_enriched": False,
+                    "history_evidence": [],
                 },
             )
             self.assertEqual(json.loads(result["eval_json"])["S1"], 95)
             self.assertIn("retrieved=2", result["trace"])
-            self.assertEqual(
-                set(calls),
-                {
-                    "Interpreter",
-                    "Retriever",
-                    "Summarizer",
-                    "Evaluator",
-                    "Critic",
-                    "Improver",
-                },
-            )
-            self.assertLess(calls.index("Interpreter"), calls.index("Summarizer"))
-            self.assertLess(calls.index("Summarizer"), calls.index("Evaluator"))
-            self.assertLess(calls.index("Evaluator"), calls.index("Critic"))
-            self.assertLess(calls.index("Critic"), calls.index("Improver"))
+            self.assertEqual(calls, EXPECTED_AGENT_ORDER)
             return {
                 "case_id": test_case.get("case_id"),
                 "question": question,
@@ -539,13 +599,51 @@ class PipelineEndToEndTests(unittest.TestCase):
 
         runtime = grpc_server.VOCGRPCRuntime()
         result = await runtime.run_with_question(question, CSV_PATH, timeout=timeout)
-        self.assertTrue(result.get("ok"), result.get("error") or result.get("message"))
 
         # Interpreter may classify a complaint as summary-only. The E2E quality
         # test must still exercise Critic and Improver, so reuse the real intent
-        # and run the live downstream pipeline with task=both.
+        # and run the live downstream pipeline with task=both. Do this before
+        # asserting the first result because an incomplete result is precisely
+        # the condition this fallback is intended to repair.
         original_intent = json.loads(result.get("intent_json") or "{}")
-        if not result.get("policy"):
+        if original_intent.get("needs_clarification"):
+            clarifying_question = str(
+                result.get("clarifying_question") or result.get("message") or ""
+            ).strip()
+            self.assertTrue(
+                clarifying_question, "clarification result has no question"
+            )
+            self.assertEqual(result.get("error"), "clarification_required")
+            return {
+                "case_id": test_case.get("case_id"),
+                "question": question,
+                "expected": {
+                    key: test_case.get(key)
+                    for key in (
+                        "expected_intent",
+                        "expected_keywords",
+                        "required_output",
+                        "prohibited_output",
+                    )
+                },
+                "agent_activity": {
+                    "Interpreter": [
+                        {
+                            "input": {"question": question},
+                            "output": {
+                                "intent": original_intent,
+                                "clarifying_question": clarifying_question,
+                            },
+                        }
+                    ]
+                },
+                "agent_call_order": ["Interpreter"],
+                "final_result": result,
+                "elapsed_seconds": round(
+                    time.perf_counter() - started_at, 6
+                ),
+            }
+        if not result.get("ok") or not result.get("policy"):
             result = await runtime.run_with_params(
                 filters=list(original_intent.get("filters") or []),
                 task="both",
@@ -577,10 +675,12 @@ class PipelineEndToEndTests(unittest.TestCase):
 
         activity: dict[str, list[dict]] = {}
         observed_order = []
+        logged_agent_actions = []
         for event in events:
             agent = event["agent"]
             if event.get("action") not in {"input", "output"}:
                 continue
+            logged_agent_actions.append((agent, event.get("action")))
             activity.setdefault(agent, []).append(event)
             if agent not in observed_order:
                 observed_order.append(agent)
@@ -590,6 +690,27 @@ class PipelineEndToEndTests(unittest.TestCase):
             EXPECTED_AGENT_ORDER,
             "live agents did not log the required order; restart all agents "
             "so they load the latest agent.log output code",
+        )
+
+        critic_output_indexes = [
+            index
+            for index, item in enumerate(logged_agent_actions)
+            if item == ("Critic", "output")
+        ]
+        improver_output_indexes = [
+            index
+            for index, item in enumerate(logged_agent_actions)
+            if item == ("Improver", "output")
+        ]
+        self.assertTrue(critic_output_indexes, "Critic output log is missing")
+        self.assertTrue(improver_output_indexes, "Improver output log is missing")
+        self.assertTrue(
+            any(
+                improver_index > critic_index
+                for critic_index in critic_output_indexes
+                for improver_index in improver_output_indexes
+            ),
+            "Improver did not run after Critic",
         )
 
         combined_output = "\n".join(

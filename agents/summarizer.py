@@ -11,6 +11,8 @@ import asyncio
 import os
 # JSON 데이터 처리
 import json
+# 근거 인용 형식 및 공백 정규화
+import re
 # gRPC 라이브러리 (비동기 서버 통신)
 import grpc
 
@@ -41,6 +43,71 @@ class SummarizerAgent:
     VOC 텍스트를 요약하고 후보(S0,S1,S2...)를 생성하며,
     필요한 경우 refine도 처리하는 agent.
     """
+
+    _EVIDENCE_PATTERN = re.compile(
+        r"^(?P<summary>.+?)\s*\|\s*근거:\s*\[VOC(?P<index>\d+)\]\s*(?P<quote>.+)$",
+        re.DOTALL,
+    )
+
+    @staticmethod
+    def _normalize_grounding_text(value: str) -> str:
+        return " ".join(str(value).split()).strip()
+
+    @classmethod
+    def _is_grounded_candidate(cls, candidate: str, texts: list[str]) -> bool:
+        """후보 요약과 인용문이 지정된 VOC 원문에 직접 포함되는지 확인한다."""
+        match = cls._EVIDENCE_PATTERN.fullmatch(str(candidate).strip())
+        if not match:
+            return False
+
+        index = int(match.group("index")) - 1
+        if index < 0 or index >= len(texts):
+            return False
+
+        source = cls._normalize_grounding_text(texts[index])
+        quote = cls._normalize_grounding_text(match.group("quote"))
+        summary = cls._normalize_grounding_text(match.group("summary"))
+        return bool(summary and quote and quote == source and summary in source)
+
+    @classmethod
+    def _fallback_grounded_candidate(cls, source: str, index: int) -> str:
+        normalized = cls._normalize_grounding_text(source)
+        return f"{normalized} | 근거: [VOC{index + 1}] {normalized}"
+
+    @classmethod
+    def grounding_check(
+        cls,
+        candidates: dict[str, str],
+        texts: list[str],
+        expected_count: int,
+    ) -> dict[str, str]:
+        """모든 후보를 원문과 대조하고 실패한 후보를 원문 발췌로 교체한다."""
+        if not texts:
+            return candidates
+
+        grounded: dict[str, str] = {}
+        replaced: list[str] = []
+        for position in range(max(1, expected_count)):
+            key = f"S{position}"
+            candidate = str(candidates.get(key, "")).strip()
+            if candidate and cls._is_grounded_candidate(candidate, texts):
+                grounded[key] = candidate
+                continue
+
+            source_index = position % len(texts)
+            grounded[key] = cls._fallback_grounded_candidate(
+                texts[source_index], source_index
+            )
+            replaced.append(key)
+
+        agent_event(
+            "Summarizer",
+            "grounding_check",
+            checked_count=len(grounded),
+            replaced_keys=replaced,
+            grounded=not replaced,
+        )
+        return grounded
 
     # ============ 초기화 메서드 ============
     def __init__(self):
@@ -97,17 +164,27 @@ class SummarizerAgent:
         # ============ 텍스트 결합 ============
         # 여러 VOC 텍스트를 줄바꿈으로 구분하여 하나의 문자열로 결합합니다
         # max_items 개수만큼만 사용하여 토큰 제한을 준수합니다
-        joined = "\n".join(texts[:effective_max_items])
+        source_texts = texts[:effective_max_items]
+        joined = "\n".join(
+            f"[VOC{index}] {text}"
+            for index, text in enumerate(source_texts, start=1)
+        )
 
         # ============ 프롬프트 구성 ============
         # LLM에게 요약 후보를 생성하도록 지시하는 프롬프트를 작성합니다
         # 형식: S0, S1, S2 등의 키와 함께 요약을 출력하도록 명시합니다
         prompt = f"""
-다음 VOC 데이터를 읽고 요약 후보를 {n}개 생성해라.
+다음 VOC 원문만 사용하여 발췌형 요약 후보를 {n}개 생성해라.
+원문에 없는 사실, 원인, 수치, 날짜, 조직, 해결책은 절대 추가하지 마라.
+요약 본문은 선택한 VOC 원문의 연속된 일부 문구를 표현 변경 없이 그대로 사용해라.
+각 후보에는 반드시 실제 원문 한 건을 전체 그대로 근거로 인용해라.
 형식:
-S0: ...
-S1: ...
-S2: ...
+S0: <원문에서 그대로 발췌한 요약> | 근거: [VOC번호] <해당 VOC 원문 전체>
+S1: <원문에서 그대로 발췌한 요약> | 근거: [VOC번호] <해당 VOC 원문 전체>
+S2: <원문에서 그대로 발췌한 요약> | 근거: [VOC번호] <해당 VOC 원문 전체>
+
+근거 인용은 입력의 VOC 번호와 원문을 한 글자도 바꾸지 말고 복사해라.
+설명, 머리말, 코드 블록은 출력하지 마라.
 
 데이터:
 {joined}
@@ -119,6 +196,9 @@ S2: ...
         # ============ 후보 파싱 및 반환 ============
         # LLM 응답에서 후보들을 파싱하여 딕셔너리 형태로 반환합니다
         candidates = self._parse_candidates(result)
+        # 후보의 요약과 근거 인용을 실제 Retriever 원문과 대조합니다.
+        # 검증 실패 후보는 원문 발췌형 후보로 교체하여 환각 전파를 차단합니다.
+        candidates = self.grounding_check(candidates, source_texts, n)
         agent_file_event(
             "Summarizer", "output", operation="make_candidates",
             candidates=candidates,
@@ -126,7 +206,12 @@ S2: ...
         return candidates
 
     # ============ 요약 개선 메서드 ============
-    async def refine(self, draft: str, edits_json: str):
+    async def refine(
+        self,
+        draft: str,
+        edits_json: str,
+        source_texts: list[str] | None = None,
+    ):
         """
         Critic이 제안한 edits 기반으로 요약문을 개선(refine)합니다.
         
@@ -140,17 +225,27 @@ S2: ...
         Returns:
             str: 개선된 요약 텍스트 (앞뒤 공백 제거)
         """
+        if not source_texts:
+            # 원문이 없으면 생성 결과를 대조할 수 없으므로 새 내용을 만들지 않습니다.
+            agent_event("Summarizer", "refine_skipped_without_sources")
+            return draft.strip()
+
         # ============ 프롬프트 구성 ============
         # 원본 요약과 수정 지침을 포함한 프롬프트를 작성합니다
         # LLM에게 수정 지침에 따라 요약을 개선하도록 지시합니다
         prompt = f"""
 아래 draft 요약문을 edits 지시에 따라 개선해라.
+VOC 원문에 없는 사실, 원인, 수치, 날짜, 조직, 해결책은 추가하지 마라.
+출력은 반드시 '<원문 발췌> | 근거: [VOC번호] <해당 VOC 원문 전체>' 형식으로 작성해라.
 
 draft:
 {draft}
 
 edits:
 {edits_json}
+
+VOC 원문:
+{chr(10).join(f'[VOC{i}] {text}' for i, text in enumerate(source_texts or [], 1))}
 
 출력: 개선된 요약문만 제공
 """
@@ -160,6 +255,10 @@ edits:
         result = await self.llm(prompt)
         # 앞뒤 공백을 제거하여 깔끔한 텍스트를 반환합니다
         refined = result.strip()
+        checked = self.grounding_check({"S0": refined}, source_texts, 1)["S0"]
+        if checked != refined:
+            agent_event("Summarizer", "refine_grounding_rejected")
+            refined = draft
         agent_file_event(
             "Summarizer", "output", operation="refine", text=refined
         )
@@ -310,6 +409,9 @@ edits:
             "need_refine": cres.need_refine,
             "edits": list(cres.edits),
             "ask_more_samples": cres.ask_more_samples,
+            "revalidated": False,
+            "feedback_applied": None,
+            "remaining_edits": [],
         }
         
         # ============ 5단계: 필요시 요약 개선 ============
@@ -317,9 +419,67 @@ edits:
             agent_event("Summarizer", "refine_summary", edits=list(cres.edits))
             summary = await self.refine(
                 summary,
-                json.dumps({"edits": list(cres.edits)}, ensure_ascii=False)
+                json.dumps({"edits": list(cres.edits)}, ensure_ascii=False),
+                source_texts=texts,
             )
             trace.append("summary_refined")
+
+            # ============ Critic 피드백 반영 재검증 ============
+            # 이전 edits와 수정 결과를 함께 전달하여 실제 반영 여부를 한 번 확인합니다.
+            revalidation_input = json.dumps(
+                {
+                    "previous_edits": list(cres.edits),
+                    "revised_summary": summary,
+                },
+                ensure_ascii=False,
+            )
+            agent_event(
+                "Summarizer",
+                "call_critic_revalidation",
+                previous_edit_count=len(cres.edits),
+            )
+            async with grpc.aio.insecure_channel(self.critic_endpoint) as ch:
+                stub = voc_pb2_grpc.CriticStub(ch)
+                recheck = await stub.Review(
+                    voc_pb2.ReviewReq(
+                        doc=revalidation_input,
+                        role="summary_revalidation",
+                    ),
+                    timeout=timeout,
+                )
+
+            feedback_applied = not recheck.need_refine
+            summary_critic_info.update(
+                {
+                    "revalidated": True,
+                    "feedback_applied": feedback_applied,
+                    "remaining_edits": list(recheck.edits),
+                    "revalidation_ask_more_samples": recheck.ask_more_samples,
+                }
+            )
+            trace.append(
+                "critic_feedback_applied"
+                if feedback_applied
+                else "critic_feedback_not_applied"
+            )
+            agent_event(
+                "Summarizer",
+                "critic_revalidation_completed",
+                feedback_applied=feedback_applied,
+                remaining_edits=list(recheck.edits),
+            )
+
+            if not feedback_applied:
+                # 원문 grounding을 통과하지 못하는 Critic 요구 때문에 정책 생성까지
+                # 중단하지 않습니다. 미반영 지침은 감사 정보에 남기고, 마지막으로
+                # 검증된 요약을 Improver에 전달합니다.
+                summary_critic_info["continued_with_grounded_summary"] = True
+                trace.append("continued_with_grounded_summary")
+                agent_event(
+                    "Summarizer",
+                    "critic_feedback_unresolved_continuing",
+                    reason="use_last_grounded_summary",
+                )
         
         # ============ 6단계: 최종 요약으로 Improver 호출 ============
         # 정책이 필요한 경우에만 모든 검토와 수정을 마친 요약으로 한 번 호출합니다.

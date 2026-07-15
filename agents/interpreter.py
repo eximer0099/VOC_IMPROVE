@@ -10,6 +10,8 @@ from __future__ import annotations
 
 # 운영체제 관련 기능 (환경변수 읽기 등)
 import os
+import csv
+import re
 # 비동기 프로그래밍 지원
 import asyncio
 # 데이터 클래스 정의 (타입 안전한 구조체)
@@ -30,6 +32,7 @@ from utils.settings import DEFAULT_CSV, openai_client, MODEL_SUMMARY
 from utils.json_utils import extract_json
 from utils.agent_log import agent_event, agent_file_event, log_authentication_error, log_response_time
 from grpc_server import bind_agent_port
+from utils.text_normalization import build_search_terms, normalize_korean_text
 
 
 # ============ 비즈니스 로직 ============
@@ -50,6 +53,10 @@ class NLIntent:
     filters: List[str] | None = None  # 검색 키워드들 (None이면 필터링 없음)
     max_items: int = 30               # 최대 VOC 개수 (기본값: 30)
     csv_path: str = DEFAULT_CSV       # 사용할 CSV 경로 (기본값: settings.DEFAULT_CSV)
+    needs_clarification: bool = False
+    clarifying_question: str = ""
+    intent_enriched: bool = False
+    history_evidence: List[str] | None = None
 
 
 # ============ 자연어 해석 에이전트 클래스 ============
@@ -76,10 +83,67 @@ class NLInterpreterAgent:
         # ============ 클라이언트 저장 ============
         # OpenAI 클라이언트를 인스턴스 변수로 저장합니다
         self.client = openai_client
-        # ============ 다음 에이전트 엔드포인트 설정 ============
-        # Retriever 에이전트의 엔드포인트를 환경변수에서 읽어옵니다
-        self.retriever_endpoint = os.environ.get("RETRIEVER_ENDPOINT", "localhost:6002")
 
+    @staticmethod
+    def _query_terms(question: str) -> List[str]:
+        tokens = re.findall(r"[0-9a-zA-Z가-힣]+", question.lower())
+        suffixes = ("에서", "으로", "에게", "부터", "까지", "이", "가", "은", "는", "을", "를")
+        terms: List[str] = []
+        for token in tokens:
+            if len(token) < 2:
+                continue
+            terms.append(token)
+            for suffix in suffixes:
+                if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+                    terms.append(token[: -len(suffix)])
+                    break
+        return build_search_terms([normalize_korean_text(question)]) or list(
+            dict.fromkeys(terms)
+        )
+
+    @classmethod
+    def is_ambiguous_question(cls, question: str) -> bool:
+        """Detect inputs that are too short or generic to establish a topic."""
+        normalized = " ".join(cls._query_terms(question))
+        generic = {
+            "안돼요", "이상해요", "문제예요", "왜 이래요", "확인해줘",
+            "처리해줘", "도와줘", "불편해요",
+        }
+        compact = re.sub(r"\s+", "", question)
+        return (
+            len(compact) < 10
+            or len(cls._query_terms(question)) <= 1
+            or normalized in generic
+            or compact in {item.replace(" ", "") for item in generic}
+        )
+
+    @classmethod
+    def find_similar_voc_history(
+        cls, question: str, csv_path: str, limit: int = 3
+    ) -> List[str]:
+        """Find read-only VOC history sharing a meaningful query term."""
+        if not os.path.exists(csv_path):
+            return []
+        generic_terms = {"안돼요", "이상해요", "문제", "확인", "처리", "도와줘"}
+        terms = [term for term in cls._query_terms(question) if term not in generic_terms]
+        if not terms:
+            return []
+        matches = []
+        try:
+            with open(csv_path, "r", encoding="utf-8", newline="") as file:
+                for row in csv.reader(file):
+                    if not row:
+                        continue
+                    # 고객 ID 등 다른 열은 감사 정보에 노출하지 않고 VOC 본문만 사용합니다.
+                    text = str(row[-1]).strip()
+                    lowered = text.lower()
+                    score = sum(term in lowered for term in terms)
+                    if score:
+                        matches.append((score, text))
+        except (OSError, UnicodeError, csv.Error):
+            return []
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        return [text for _, text in matches[:limit]]
     # ============ 자연어 파싱 메서드 ============
     async def parse(self, question: str, default_csv: Optional[str] = None) -> NLIntent:
         """
@@ -181,6 +245,30 @@ class NLInterpreterAgent:
             # 그 외의 경우 LLM이 제공한 경로를 사용합니다
             csv_path = raw_csv
 
+        ambiguous = self.is_ambiguous_question(question)
+        history_evidence = (
+            self.find_similar_voc_history(question, csv_path) if ambiguous else []
+        )
+        intent_enriched = bool(history_evidence)
+        needs_clarification = ambiguous and not intent_enriched
+        clarifying_question = ""
+        if intent_enriched:
+            history_terms = self._query_terms(question)
+            filters = build_search_terms([*filters, *history_terms])
+            agent_event(
+                "Interpreter", "intent_enriched_from_history",
+                evidence_count=len(history_evidence), filters=filters,
+            )
+        elif needs_clarification:
+            clarifying_question = (
+                "어떤 기능에서 어떤 문제가 발생했는지 조금 더 구체적으로 알려주세요. "
+                "예: 로그인 인증번호 지연, 결제 승인 오류, 환불 처리 지연"
+            )
+            agent_event(
+                "Interpreter", "clarification_required",
+                question=question, clarifying_question=clarifying_question,
+            )
+
         # ============ NLIntent 객체 생성 및 반환 ============
         # 파싱된 모든 정보를 NLIntent 객체로 만들어 반환합니다
         return NLIntent(
@@ -188,6 +276,10 @@ class NLInterpreterAgent:
             filters=filters,
             max_items=max_items,
             csv_path=csv_path,
+            needs_clarification=needs_clarification,
+            clarifying_question=clarifying_question,
+            intent_enriched=intent_enriched,
+            history_evidence=history_evidence,
         )
 
 
@@ -220,8 +312,8 @@ class InterpreterServicer(voc_pb2_grpc.InterpreterServicer):
         """
         ParseQuestion RPC를 구현합니다.
         
-        클라이언트로부터 자연어 질의를 받아 구조화된 의도로 변환하고,
-        Retriever를 직접 호출하여 전체 파이프라인을 시작합니다.
+        클라이언트로부터 자연어 질의를 받아 구조화된 의도로 변환합니다.
+        후속 Agent 호출은 Orchestrator/Summarizer의 단일 파이프라인이 담당합니다.
         
         Args:
             request: ParseQuestionReq 메시지 (question, default_csv 포함)
@@ -238,31 +330,18 @@ class InterpreterServicer(voc_pb2_grpc.InterpreterServicer):
                 default_csv=request.default_csv or None, # 기본 CSV 경로
             )
             
-            # ============ Retriever 직접 호출 ============
-            # Interpreter가 Retriever를 직접 호출하여 파이프라인을 시작합니다
-            # Retriever가 다음 에이전트(Summarizer)를 호출하므로 여기서는 호출만 수행
-            agent_event("Interpreter", "call_retriever", filters=intent.filters or [])
-            async with grpc.aio.insecure_channel(self.agent.retriever_endpoint) as ch:
-                stub = voc_pb2_grpc.RetrieverStub(ch)
-                rres = await stub.Retrieve(
-                    voc_pb2.RetrieveReq(
-                        csv_path=intent.csv_path,
-                        filters=intent.filters or [],
-                        max_items=intent.max_items,
-                    ),
-                    timeout=180.0
-                )
-            # Retriever가 Summarizer를 호출하므로 여기서는 결과를 기다리지 않음
-            
             # ============ 응답 메시지 생성 및 반환 ============
             # 파싱된 의도를 gRPC 응답 메시지로 감싸서 반환합니다
-            # (실제로는 Retriever가 다음 단계를 호출하므로 여기서는 intent만 반환)
             agent_event("Interpreter", "completed", task=intent.task)
             return voc_pb2.ParseQuestionRes(
                 task=intent.task,                    # 작업 유형
                 filters=intent.filters or [],        # 필터 키워드 리스트
                 max_items=intent.max_items,          # 최대 항목 수
                 csv_path=intent.csv_path,            # CSV 파일 경로
+                needs_clarification=intent.needs_clarification,
+                clarifying_question=intent.clarifying_question,
+                intent_enriched=intent.intent_enriched,
+                history_evidence=intent.history_evidence or [],
             )
         except Exception as e:
             log_authentication_error("Interpreter", e)

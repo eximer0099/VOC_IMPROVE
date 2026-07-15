@@ -40,6 +40,10 @@ message ParseQuestionRes {
   repeated string filters = 2;
   int32 max_items      = 3;
   string csv_path      = 4;
+  bool needs_clarification = 5;
+  string clarifying_question = 6;
+  bool intent_enriched = 7;
+  repeated string history_evidence = 8;
 }
 
 // ---------- Retriever ----------

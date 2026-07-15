@@ -96,12 +96,34 @@ class CriticAgent:
 
         # ============ 역할 설명 결정 ============
         # 역할에 따라 프롬프트에 사용할 설명을 결정합니다
-        role_desc = "요약문" if role == "summary" else "정책 개선안"
+        if role == "summary_revalidation":
+            role_desc = "수정된 요약문의 이전 피드백 반영 여부"
+            review_instruction = (
+                "입력 JSON의 previous_edits 각 항목이 revised_summary에 실제로 "
+                "반영되었는지 검증해라. 모두 반영되었으면 need_refine=false와 "
+                "빈 edits를 반환하고, 미반영 항목이 있으면 need_refine=true와 "
+                "미반영된 지침만 edits에 반환해라. 원문에 없는 내용 추가를 "
+                "요구하지 마라."
+            )
+        else:
+            role_desc = "요약문" if role == "summary" else "정책 개선안"
+            if role == "summary":
+                review_instruction = (
+                    "수정이 필요한지 판단하되, 제시된 요약과 근거에 이미 존재하는 "
+                    "사실만 재구성하는 수정 지침을 제안해라. 근거에 없는 시점, 채널, "
+                    "수치, 고객 영향, 거래 정보, 원인 가설, 정책 조치를 추가하라고 "
+                    "요구하지 마라. 근거가 부족하면 수정을 요구하지 말고 "
+                    "ask_more_samples=true로 표시해라."
+                )
+            else:
+                review_instruction = (
+                    "수정이 필요한지 판단하고 구체적인 수정 지침을 제안해라."
+                )
 
         # ============ 프롬프트 구성 ============
         # LLM에게 문서를 검토하고 수정 지침을 생성하도록 지시하는 프롬프트를 작성합니다
         prompt = f"""
-다음 {role_desc}를 검토한 뒤, 수정이 필요한지 판단하고 구체적인 수정 지침을 제안해라.
+다음 {role_desc}를 검토해라. {review_instruction}
 
 [텍스트]
 {doc}
@@ -128,6 +150,7 @@ class CriticAgent:
                     "content": (
                         "너는 VOC 요약 및 정책 개선안을 검토하는 Critic Agent이다. "
                         "텍스트의 명확성, 일관성, 구체성, 실행 가능성을 기준으로 개선이 필요한지 판단하고 "
+                        "summary_revalidation 역할에서는 이전 피드백의 실제 반영 여부만 검증하며 "
                         "JSON 형식으로만 결과를 반환해라."
                     ),
                 },

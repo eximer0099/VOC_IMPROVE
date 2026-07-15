@@ -26,6 +26,7 @@ from utils.agent_log import (
     log_response_time,
 )
 from grpc_server import bind_agent_port
+from utils.text_normalization import build_search_terms, normalize_korean_text
 
 
 # ============ Retriever Agent 비즈니스 로직 ============
@@ -54,7 +55,7 @@ class RetrieverAgent:
         results: list[str] = []
         with open(csv_path, "r", encoding="utf-8", newline="") as fp:
             for row in csv.reader(fp):
-                line = " ".join(row).lower()
+                line = normalize_korean_text(" ".join(row))
                 if not filters or any(value in line for value in filters):
                     results.append(" ".join(row))
                     if len(results) >= max_items:
@@ -119,12 +120,13 @@ class RetrieverAgent:
         # 필터 키워드들을 소문자로 변환하고 앞뒤 공백을 제거합니다
         # 빈 문자열은 제외합니다
         input_parts = [str(f).strip() for f in (filters or []) if str(f).strip()]
-        filters = [value.lower() for value in input_parts]
-
-        # ============ 필터 사용 여부 결정 ============
-        # 빈 필터 리스트는 필터링을 사용하지 않음을 의미합니다
-        # 전체 반환 모드가 아니라 필터가 없으면 모든 행을 반환합니다
-        use_filter = len(filters) > 0
+        primary_filters = [
+            normalized
+            for value in input_parts
+            if (normalized := normalize_korean_text(value))
+        ]
+        expanded_filters = build_search_terms(input_parts)
+        filters = primary_filters
 
         # ============ max_items 검증 및 제한 ============
         # max_items를 정수로 변환하고 유효한 범위로 제한합니다
@@ -144,31 +146,20 @@ class RetrieverAgent:
         if max_items > 500:
             max_items = 500
 
-        # ============ 결과 리스트 초기화 ============
-        results = []
-
-        # ============ CSV 파일 읽기 및 필터링 ============
-        # UTF-8 인코딩으로 CSV 파일을 열어 한글을 올바르게 처리합니다
-        with open(csv_path, "r", encoding="utf-8") as fp:
-            csv_reader = csv.reader(fp)
-            # ============ 각 행 처리 ============
-            for row in csv_reader:
-                # ============ 행을 문자열로 변환 ============
-                # CSV의 각 열을 공백으로 결합하여 하나의 문자열로 만듭니다
-                # 소문자로 변환하여 대소문자 구분 없이 검색합니다
-                line = " ".join(row).lower()
-
-                # ============ OR 조건 필터링 ============
-                # 필터를 사용하지 않거나, 필터 키워드 중 하나라도 포함되면 결과에 추가합니다
-                # any() 함수는 리스트의 요소 중 하나라도 조건을 만족하면 True를 반환합니다
-                if not use_filter or any(f in line for f in filters):
-                    # 원본 행을 공백으로 결합하여 결과에 추가합니다 (소문자 변환 전 원본 사용)
-                    results.append(" ".join(row))
-
-                    # ============ 최대 개수 도달 시 조기 종료 ============
-                    # max_items 개수에 도달하면 더 이상 검색하지 않고 반복문을 종료합니다
-                    if len(results) >= max_items:
-                        break
+        # 전체 구문 검색을 우선하여 정밀도를 유지하고, 결과가 없을 때만
+        # 오탈자/구어체에서 추출한 핵심 토큰으로 재검색합니다.
+        results = self._search_csv(csv_path, primary_filters, max_items)
+        if not results and expanded_filters != primary_filters:
+            filters = expanded_filters
+            results = self._search_csv(csv_path, filters, max_items)
+            if results:
+                agent_event(
+                    "Retriever",
+                    "normalized_fallback_match",
+                    primary_filters=primary_filters,
+                    expanded_filters=expanded_filters,
+                    retrieved_count=len(results),
+                )
 
         # ============ 결과 반환 ============
         if not results:

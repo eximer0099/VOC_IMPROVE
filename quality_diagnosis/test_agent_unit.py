@@ -178,6 +178,40 @@ class AgentQualityTests(unittest.TestCase):
                 self.assertEqual(int(endpoint.rsplit(":", 1)[1]), expected_ports[name])
                 self.assertTrue(hasattr(voc_pb2_grpc, f"{name}Stub"))
 
+    def test_pipeline_downstream_calls_have_one_owner_and_no_cycles(self) -> None:
+        """Only Summarizer may invoke the ordered downstream agent chain."""
+        sources = {
+            spec.module: spec.path.read_text(encoding="utf-8")
+            for spec in AGENT_SPECS
+        }
+        downstream = ("Retriever", "Evaluator", "Critic", "Improver")
+
+        for agent in downstream:
+            marker = f"voc_pb2_grpc.{agent}Stub("
+            owners = [name for name, source in sources.items() if marker in source]
+            with self.subTest(agent=agent):
+                self.assertEqual(owners, ["summarizer"])
+                expected_calls = 2 if agent == "Critic" else 1
+                self.assertEqual(
+                    sources["summarizer"].count(marker), expected_calls
+                )
+
+        # Critic의 두 번째 호출은 최초 피드백이 발생한 경우에만 수행하는
+        # 단일 재검증이며, 전체 파이프라인을 다시 시작하지 않습니다.
+        self.assertIn('role="summary_revalidation"', sources["summarizer"])
+        self.assertIn("if cres.need_refine and cres.edits:", sources["summarizer"])
+        self.assertIn(
+            "critic_feedback_unresolved_continuing", sources["summarizer"]
+        )
+        self.assertLess(
+            sources["summarizer"].index("critic_feedback_unresolved_continuing"),
+            sources["summarizer"].index('agent_event("Summarizer", "call_improver")'),
+        )
+
+        interpreter_source = sources["interpreter"]
+        self.assertNotIn("call_retriever", interpreter_source)
+        self.assertNotIn("retriever_endpoint", interpreter_source)
+
     @unittest.skipUnless(
         os.getenv("RUN_LIVE_AGENT_TESTS") == "1",
         "set RUN_LIVE_AGENT_TESTS=1 after running launch_agents.py",
