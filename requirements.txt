@@ -1,6 +1,12 @@
+# LLM providers
 anthropic>=0.116,<1
+openai>=2.45,<3
+
+# Agent communication and MCP
 grpcio>=1.82,<2
 mcp>=1.28,<2
-openai>=2.45,<3
 protobuf>=6.33,<7
+
+# LLM Judge HTTP client and environment configuration
+httpx>=0.28,<1
 python-dotenv>=1.2,<2

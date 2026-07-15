@@ -29,7 +29,7 @@ MCP stdio server.
 VOC_Improve/
 |-- agents/                 # The six gRPC agent services
 |-- llm_wrappers/           # OpenAI and Anthropic client wrappers
-|-- quality_diagnosis/      # Quality, fault-tolerance, and end-to-end tests
+|-- quality_diagnosis/      # Test cases, LLM judge, reports, and QA tests
 |-- tests/                  # Main automated test suite
 |-- utils/                  # Settings, MCP tools, logging, and helpers
 |-- grpc_server.py          # Pipeline orchestrator
@@ -98,6 +98,10 @@ Optional settings include:
 # Override the default models.
 A2A_MODEL_SUMMARY=gpt-5.2
 A2A_MODEL_POLICY=claude-sonnet-5
+
+# Optional models used only by the LLM judge.
+OPENAI_JUDGE_MODEL=gpt-5.2
+ANTHROPIC_JUDGE_MODEL=claude-sonnet-5
 
 # Override the default input file.
 A2A_VOC_CSV=C:\path\to\voc.csv
@@ -168,6 +172,98 @@ The MCP server provides these tools:
 
 Runtime events are written to `agent.log` unless `AGENT_LOG_PATH` overrides the
 location.
+
+## LLM quality diagnosis
+
+The `quality_diagnosis` workflow evaluates saved pipeline results independently
+of the live gRPC services. It uses OpenAI to judge policy quality and Anthropic
+to judge candidate-summary fidelity.
+
+### Judge inputs
+
+- `quality_diagnosis/judge_cases.json` contains 20 cases. Each case has a
+  `question`, candidate summaries (`S0`, `S1`, and `S2`), and a generated
+  `policy`.
+- `quality_diagnosis/judge_rubric.json` defines the five scoring categories and
+  their maximum scores.
+
+| Provider | Category | Maximum |
+|---|---|---:|
+| OpenAI | 정확성 (accuracy) | 25 |
+| OpenAI | 정책 구체성 (policy specificity) | 20 |
+| OpenAI | 유용성 (usefulness) | 20 |
+| OpenAI | 안전성 (safety) | 15 |
+| Anthropic | 요약 충실성 (summary fidelity) | 20 |
+| | **Total** | **100** |
+
+The OpenAI and Anthropic evaluations for one case run concurrently. Scores are
+validated in Python against the rubric ranges before they are accepted.
+
+### Convert judge cases to Markdown
+
+Extract 20 sequential Interpreter/Summarizer/Improver cases from `agent.log`,
+write `judge_cases.json`, and then generate its readable Markdown version:
+
+```powershell
+.\.venv\Scripts\python.exe quality_diagnosis\qa_test_utils.py
+```
+
+This writes both `quality_diagnosis/judge_cases.json` and
+`quality_diagnosis/judge_cases.md`. Custom paths and case counts are supported:
+
+```powershell
+.\.venv\Scripts\python.exe quality_diagnosis\qa_test_utils.py `
+  --agent-log agent.log `
+  --case-count 20 `
+  --input quality_diagnosis\judge_cases.json `
+  --output quality_diagnosis\judge_cases.md
+```
+
+### Run the LLM judge
+
+Both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` must be available in `.env`.
+Running the judge makes real API calls and consumes API credits:
+
+```powershell
+.\.venv\Scripts\python.exe quality_diagnosis\llm_judge.py
+```
+
+Optional input and output paths can be supplied explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe quality_diagnosis\llm_judge.py `
+  --cases quality_diagnosis\judge_cases.json `
+  --rubric quality_diagnosis\judge_rubric.json `
+  --output quality_diagnosis\reports\llm_judge_result.csv `
+  --json-output quality_diagnosis\reports\llm_judge_result.json `
+  --defect-report quality_diagnosis\defect_report.md
+```
+
+The judge creates or updates these outputs:
+
+- `reports/llm_judge_result.csv`: `question`, total score, and `PASS/FAIL`.
+  A score of 80 or higher is `PASS`; a lower score is `FAIL`.
+- `reports/llm_judge_result.json`: the question and all five category scores.
+- `defect_report.md`: case count, average score, deployment decision, and any
+  critical policy defects.
+
+CSV and JSON results are written after every completed case, so completed work
+is retained if a later API call fails. A new run replaces results from the
+previous run. The defect report is written only after every case completes.
+
+The average-score deployment decision is:
+
+| Average | Decision |
+|---:|---|
+| 90 or higher | 배포 가능 (ready to deploy) |
+| 80–89.99 | 조건부 배포 (conditional deployment) |
+| 70–79.99 | 개선 후 재시험 (improve and retest) |
+| Below 70 | 배포 보류 (deployment on hold) |
+
+Regardless of the average, deployment is put on hold if any policy exposes
+personal or sensitive information, invents a policy or fact, presents a failed
+operation as successful, or gives definitive incorrect payment/refund guidance.
+The triggering question and defect type are recorded in `defect_report.md`.
 
 ## Forwarding VOC statements to the Interpreter
 
@@ -258,6 +354,7 @@ Run the isolated quality-diagnosis tests:
 python -m unittest quality_diagnosis.test_agent_unit -v
 python -m unittest quality_diagnosis.test_mcp_tools -v
 python -m unittest quality_diagnosis.test_fault_tolerance -v
+python -m unittest quality_diagnosis.test_llm_judge -v
 ```
 
 The live end-to-end quality test makes real model calls and expects all six
@@ -282,5 +379,3 @@ times.
   `A2A_VOC_CSV`, or pass an absolute `csv_path` to the analysis tool.
 - **PowerShell cannot activate the environment:** call
   `.\.venv\Scripts\python.exe` directly instead of activating it.
-#   V O C _ I M P R O V E  
- 
