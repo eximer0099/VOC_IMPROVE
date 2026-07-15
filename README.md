@@ -19,8 +19,9 @@ The analysis pipeline contains six agents:
 5. **Critic** reviews the selected output for quality problems.
 6. **Improver** generates a policy improvement proposal.
 
-The Interpreter is parsing-only and does not call downstream agents. After its
-intent is returned, the processing chain runs once in the fixed order
+The Interpreter does not call or orchestrate downstream agents. It only builds
+the intent and may perform a read-only history lookup for ambiguous input. After
+its intent is returned, the primary processing chain runs in the fixed order
 `Retriever -> Summarizer -> Evaluator -> Critic -> Improver`. Summarizer owns
 this downstream orchestration; no other agent calls backward or restarts the
 chain.
@@ -77,18 +78,52 @@ MCP stdio server.
 
 ```text
 VOC_Improve/
-|-- agents/                 # The six gRPC agent services
-|-- llm_wrappers/           # OpenAI and Anthropic client wrappers
-|-- quality_diagnosis/      # Test cases, LLM judge, reports, and QA tests
-|-- tests/                  # Main automated test suite
-|-- utils/                  # Settings, MCP tools, logging, and helpers
-|-- grpc_server.py          # Pipeline orchestrator
-|-- launch_agents.py        # Starts and supervises all agent services
+|-- agents/
+|   |-- interpreter.py      # Intent parsing, clarification, history enrichment
+|   |-- retriever.py        # Normalized two-stage VOC search
+|   |-- summarizer.py       # Candidate generation, grounding, orchestration
+|   |-- evaluator.py        # Candidate scoring and winner selection
+|   |-- critic.py           # Review and feedback revalidation
+|   `-- improver.py         # Policy generation
+|-- llm_wrappers/
+|   |-- openai_chat.py
+|   `-- anthropic_chat.py
+|-- quality_diagnosis/
+|   |-- reports/
+|   |   |-- test_result.csv
+|   |   |-- llm_judge_result.csv
+|   |   |-- llm_judge_result.json
+|   |   |-- quality_score_report.md
+|   |   `-- deployment_decision.md
+|   |-- test_cases.json
+|   |-- expected_results.json
+|   |-- evaluation_rubric.csv
+|   |-- judge_cases.json
+|   |-- judge_cases.md
+|   |-- judge_rubric.json
+|   |-- llm_judge.py
+|   |-- qa_test_utils.py
+|   |-- defect_report.md
+|   `-- test_*.py
+|-- tests/
+|   |-- test_agent_log.py
+|   `-- test_agent_pipeline.py
+|-- utils/
+|   |-- agent_log.py
+|   |-- json_utils.py
+|   |-- settings.py
+|   |-- text_normalization.py
+|   `-- tools.py
+|-- grpc_server.py          # Pipeline orchestrator and intent guardrail
+|-- launch_agents.py        # Starts and supervises all six agents
 |-- main.py                 # MCP stdio server entry point
 |-- voc.csv                 # Default VOC input data
 |-- voc.proto               # gRPC service definitions
-|-- requirements.txt        # pip dependencies
-`-- pyproject.toml          # Python project metadata
+|-- voc_pb2.py              # Generated protobuf messages
+|-- voc_pb2_grpc.py         # Generated gRPC stubs and servicers
+|-- agent.log               # Runtime JSONL event log
+|-- requirements.txt
+`-- pyproject.toml
 ```
 
 ## Requirements
@@ -269,6 +304,14 @@ This writes both `quality_diagnosis/judge_cases.json` and
   --output quality_diagnosis\judge_cases.md
 ```
 
+Mapping is bounded by Interpreter inputs: for each question, the first
+`Summarizer/output/operation=make_candidates` and the first
+`Improver/output/operation=improve` before the next Interpreter input are used.
+If either event is absent, its JSON value is written as `null` and processing
+continues with the next question. The Markdown view displays these missing
+values as `NULL`. This preserves clarification-only and failed/partial runs
+instead of silently dropping them.
+
 ### Run the LLM judge
 
 Both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` must be available in `.env`.
@@ -297,6 +340,10 @@ The judge creates or updates these outputs:
 - `defect_report.md`: case count, average score, deployment decision, and any
   critical policy defects.
 
+Cases containing `null` candidates or policies remain valid extraction output,
+but they should be completed or intentionally handled before running the LLM
+judge because the provider scoring prompts expect content to evaluate.
+
 CSV and JSON results are written after every completed case, so completed work
 is retained if a later API call fails. A new run replaces results from the
 previous run. The defect report is written only after every case completes.
@@ -315,81 +362,6 @@ personal or sensitive information, invents a policy or fact, presents a failed
 operation as successful, or gives definitive incorrect payment/refund guidance.
 The triggering question and defect type are recorded in `defect_report.md`.
 
-## Forwarding VOC statements to the Interpreter
-
-Start the six agents before forwarding a statement. The Interpreter listens at
-`localhost:6001` by default and converts the statement into a structured intent
-containing a task, filters, item limit, and CSV path.
-
-### Through the MCP server (recommended)
-
-Call `analyze_voc_nl_v2` from the connected MCP client and put the raw customer
-statement in the `question` field:
-
-```json
-{
-  "question": "My payment was completed, but the order status has not changed.",
-  "csv_path": "C:\\path\\to\\VOC_Improve\\voc.csv"
-}
-```
-
-The request follows this route:
-
-```text
-MCP client -> analyze_voc_nl_v2 -> Interpreter -> remaining agent pipeline
-```
-
-The `csv_path` field is optional. When omitted, the application uses
-`A2A_VOC_CSV` or the project-root `voc.csv`. The returned object includes the
-generated `summary`, `policy`, and `intent_json` produced from the Interpreter's
-classification.
-
-### Directly through gRPC (development and debugging)
-
-To inspect only the Interpreter's structured response, save the following as a
-temporary script in the project root and run it while the agents are active:
-
-```python
-import asyncio
-
-import grpc
-
-import voc_pb2
-import voc_pb2_grpc
-
-
-async def main() -> None:
-    statement = "My payment was completed, but the order status has not changed."
-
-    async with grpc.aio.insecure_channel("localhost:6001") as channel:
-        interpreter = voc_pb2_grpc.InterpreterStub(channel)
-        response = await interpreter.ParseQuestion(
-            voc_pb2.ParseQuestionReq(
-                question=statement,
-                default_csv="voc.csv",
-            ),
-            timeout=30,
-        )
-
-    print("task:", response.task)
-    print("filters:", list(response.filters))
-    print("max_items:", response.max_items)
-    print("csv_path:", response.csv_path)
-
-
-asyncio.run(main())
-```
-
-Run the script with the project's virtual environment:
-
-```powershell
-python forward_voc.py
-```
-
-For an Interpreter running elsewhere, replace `localhost:6001` with its address.
-When using the complete application, set `INTERPRETER_ENDPOINT` in `.env` to the
-same address.
-
 ## Running tests
 
 Run the main unit and pipeline tests from the project root:
@@ -405,18 +377,73 @@ python -m unittest quality_diagnosis.test_agent_unit -v
 python -m unittest quality_diagnosis.test_mcp_tools -v
 python -m unittest quality_diagnosis.test_fault_tolerance -v
 python -m unittest quality_diagnosis.test_llm_judge -v
+python -m unittest quality_diagnosis.test_qa_test_utils -v
 ```
 
-The live end-to-end quality test makes real model calls and expects all six
-agents to already be running in another terminal:
+### Run `test_pipeline_e2e.py`
+
+The E2E module contains two deterministic in-process gRPC checks for controlled
+clarification and the `Critic -> Improver` transition. The full test iterates
+over `quality_diagnosis/test_cases.json`, calls the six live Agent services, and
+can use OpenAI to score the collected results against
+`evaluation_rubric.csv`.
+
+Before running the full test, confirm that `.env` contains the API keys required
+by the configured Agent models. Live execution consumes API credits.
+
+In the first PowerShell terminal, start all Agent services:
 
 ```powershell
-python -m unittest quality_diagnosis.test_pipeline_e2e -v
+cd C:\VOC_Improve
+.\.venv\Scripts\python.exe launch_agents.py
 ```
 
-Quality reports are generated under `quality_diagnosis/reports/`. Live tests can
-consume API credits and may take several minutes depending on model response
-times.
+Wait until ports `6001` through `6006` are ready. In a second terminal, run the
+test file directly from the project root:
+
+```powershell
+cd C:\VOC_Improve
+.\.venv\Scripts\python.exe quality_diagnosis\test_pipeline_e2e.py -v
+```
+
+The equivalent module command is:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest quality_diagnosis.test_pipeline_e2e -v
+```
+
+The per-RPC timeout defaults to 180 seconds. Increase it for slow model
+responses before launching the test:
+
+```powershell
+$env:GRPC_E2E_TIMEOUT_SECONDS = "300"
+.\.venv\Scripts\python.exe quality_diagnosis\test_pipeline_e2e.py -v
+```
+
+`OPENAI_EVAL_MODEL` optionally overrides the model used for the final quality
+evaluation. If `OPENAI_API_KEY` is unavailable, that final scoring stage is
+skipped, although the live Agent pipeline still requires the provider keys used
+by its configured models.
+
+Successful full execution writes or updates:
+
+- `quality_diagnosis/reports/test_result.csv`
+- `quality_diagnosis/reports/quality_score_report.md`
+- `quality_diagnosis/reports/deployment_decision.md`
+
+To run only the API-independent Critic-to-Improver check without starting the
+six external services:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest `
+  quality_diagnosis.test_pipeline_e2e.PipelineEndToEndTests.test_critic_is_followed_by_improver_in_local_e2e `
+  -v
+```
+
+After changing Agent code or `voc.proto`, restart all six services before a live
+E2E run. Otherwise the test process and Agent processes may load different code
+or protobuf definitions. Live tests can take several minutes because all cases
+make model calls.
 
 ## Troubleshooting
 
