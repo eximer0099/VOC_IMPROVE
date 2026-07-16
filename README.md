@@ -188,6 +188,10 @@ A2A_MODEL_POLICY=claude-sonnet-5
 OPENAI_JUDGE_MODEL=gpt-5.2
 ANTHROPIC_JUDGE_MODEL=claude-sonnet-5
 
+# Optional OpenAI model used to score the live E2E test results.
+# Falls back to A2A_MODEL_SUMMARY when omitted.
+OPENAI_EVAL_MODEL=gpt-5.2
+
 # Override the default input file.
 A2A_VOC_CSV=C:\path\to\voc.csv
 
@@ -258,17 +262,59 @@ The MCP server provides these tools:
 Runtime events are written to `agent.log` unless `AGENT_LOG_PATH` overrides the
 location.
 
+## Run the live E2E quality test
+
+Run `test_pipeline_e2e.py` before the saved-result LLM quality diagnosis so the
+pipeline activity, test reports, and `agent.log` reflect the current code. The
+full run uses the configured Agent providers and OpenAI evaluator, so confirm
+that the required API keys are available in `.env`.
+
+In the first PowerShell terminal, start all six Agent services from the project
+root:
+
+```powershell
+cd C:\VOC_Improve
+.\.venv\Scripts\python.exe launch_agents.py
+```
+
+Wait until ports `6001` through `6006` are ready. In a second PowerShell
+terminal, run the E2E suite:
+
+```powershell
+cd C:\VOC_Improve
+.\.venv\Scripts\python.exe quality_diagnosis\test_pipeline_e2e.py -v
+```
+
+The run evaluates all cases in `quality_diagnosis/test_cases.json` and updates:
+
+- `quality_diagnosis/reports/test_result.csv`
+- `quality_diagnosis/reports/quality_score_report.md`
+- `quality_diagnosis/reports/deployment_decision.md`
+- `agent.log`, which is the source for the saved-result judge cases
+
+After the E2E run completes, continue with the LLM quality diagnosis below to
+extract fresh judge cases and run the independent OpenAI/Anthropic judge. See
+[Run `test_pipeline_e2e.py`](#run-test_pipeline_e2epy) for timeout, model, and
+API-independent test options.
+
 ## LLM quality diagnosis
 
-The `quality_diagnosis` workflow evaluates saved pipeline results independently
-of the live gRPC services. It uses OpenAI to judge policy quality and Anthropic
-to judge candidate-summary fidelity.
+The project has two complementary quality workflows:
+
+- The saved-result LLM judge reads extracted cases from `agent.log`. It uses
+  OpenAI to judge policy quality and Anthropic to judge candidate-summary
+  fidelity, independently of the live gRPC services.
+- The live E2E workflow runs `test_cases.json` through all six services and then
+  uses OpenAI to score every rubric item. Python calculates the per-case totals,
+  normalized scores, average, and deployment decision from those model scores.
 
 ### Judge inputs
 
 - `quality_diagnosis/judge_cases.json` contains 20 cases. Each case has a
   `question`, candidate summaries (`S0`, `S1`, and `S2`), and a generated
-  `policy`.
+  `policy`. Candidates and policy are nullable for clarification-only or
+  incomplete pipeline runs. The current extracted data contains two cases with
+  null candidates and policies.
 - `quality_diagnosis/judge_rubric.json` defines the five scoring categories and
   their maximum scores.
 
@@ -362,6 +408,14 @@ personal or sensitive information, invents a policy or fact, presents a failed
 operation as successful, or gives definitive incorrect payment/refund guidance.
 The triggering question and defect type are recorded in `defect_report.md`.
 
+### Current saved-result judge status
+
+The latest checked-in judge outputs contain 20 cases with an average score of
+**67.10/100**, so the score-based decision is **배포 보류**. The critical-defect
+guardrail also holds deployment because eight cases were flagged for invented
+policies or facts. See `quality_diagnosis/defect_report.md` for the questions
+and defect types. Re-running the judge replaces these generated values.
+
 ## Running tests
 
 Run the main unit and pipeline tests from the project root:
@@ -387,6 +441,31 @@ clarification and the `Critic -> Improver` transition. The full test iterates
 over `quality_diagnosis/test_cases.json`, calls the six live Agent services, and
 can use OpenAI to score the collected results against
 `evaluation_rubric.csv`.
+
+The current live E2E suite contains 20 cases. TC-19 checks the generic
+screen-visibility failure, `화면에 아무 것도 보이지 않습니다.`, and TC-20
+checks a coupon state error, `쿠폰을 적용했는데 이미 사용한 것으로 나옵니다.`.
+Their expected output still exercises failure disclosure, fallback behavior,
+human escalation, and recovery guidance without embedding artificial system
+conditions in the user question.
+
+The E2E rubric totals 100 points:
+
+| Rubric item | Maximum |
+|---|---:|
+| Interpreter 해석 정확성 | 15 |
+| Retriever 검색 관련성 | 15 |
+| Summarizer 사실성·요약성 | 15 |
+| Evaluator 평가 타당성 | 10 |
+| Critic 위험 탐지력 | 10 |
+| Improver 실행 가능성 | 15 |
+| Agent 연계 품질 | 10 |
+| 장애 대응·로그 | 5 |
+| 성능 | 5 |
+| **Total** | **100** |
+
+The performance item awards up to 5 points against the current **40-second**
+response-time criterion. This replaces the earlier 5-second criterion.
 
 Before running the full test, confirm that `.env` contains the API keys required
 by the configured Agent models. Live execution consumes API credits.
@@ -421,15 +500,22 @@ $env:GRPC_E2E_TIMEOUT_SECONDS = "300"
 ```
 
 `OPENAI_EVAL_MODEL` optionally overrides the model used for the final quality
-evaluation. If `OPENAI_API_KEY` is unavailable, that final scoring stage is
-skipped, although the live Agent pipeline still requires the provider keys used
-by its configured models.
+evaluation. If it is not set, the evaluator uses `A2A_MODEL_SUMMARY` (default
+`gpt-5.2`). The generated CSV does not record the model name, so set and track
+`OPENAI_EVAL_MODEL` explicitly when model-level reproducibility is required. If
+`OPENAI_API_KEY` is unavailable, that final scoring stage is skipped, although
+the live Agent pipeline still requires the provider keys used by its configured
+models.
 
 Successful full execution writes or updates:
 
 - `quality_diagnosis/reports/test_result.csv`
 - `quality_diagnosis/reports/quality_score_report.md`
 - `quality_diagnosis/reports/deployment_decision.md`
+
+The latest generated E2E report scores the 20 cases at an average of
+**58.20/100**, resulting in **배포 보류**. These values are snapshots of the
+most recent run and change whenever the full E2E evaluation is rerun.
 
 To run only the API-independent Critic-to-Improver check without starting the
 six external services:

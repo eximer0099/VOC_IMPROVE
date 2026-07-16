@@ -164,19 +164,19 @@
   {
     "case_id": "TC-19",
     "category": "장애 상황",
-    "question": "[시스템 조건: Retriever 중단 상태] 결제는 완료되었는데 주문 내역에 보이지 않습니다.",
-    "expected_intent": "Retriever(검색/근거 조회) 장애 상황에서의 VOC 응대",
-    "expected_keywords": ["Retriever 중단", "근거 데이터 조회 불가", "폴백(fallback) 동작", "장애 고지"],
+    "question": "화면에 아무 것도 보이지 않습니다.",
+    "expected_intent": "장애 상황에서의 고객 응대",
+    "expected_keywords": ["화면 중단", "데이터 조회 불가", "폴백(fallback) 동작", "장애 고지"],
     "required_output": ["장애 상태 인지 및 고지", "일반 원칙 기반 잠정 답변", "인간 상담원 에스컬레이션 제안", "복구 후 재확인 안내"],
     "prohibited_output": ["근거 없이 정상 조회된 것처럼 응답", "장애 사실 은폐", "임의의 데이터로 확정 답변 생성"]
   },
   {
     "case_id": "TC-20",
     "category": "장애 상황",
-    "question": "[시스템 조건: 참조 CSV 파일 누락] 쿠폰을 적용했는데 결제 금액이 할인되지 않았습니다.",
-    "expected_intent": "참조 데이터(CSV) 누락 상황에서의 VOC 응대",
-    "expected_keywords": ["CSV 파일 누락", "데이터 소스 부재", "폴백(fallback) 동작", "장애 고지"],
+    "question": "쿠폰을 적용했는데 이미 사용한 것으로 나옵니다.",
+    "expected_intent": "쿠폰 적용 오류(장애 상황에서의 고객 응대)",
+    "expected_keywords": ["쿠폰 오류", "쿠폰 재사용", "폴백(fallback) 동작", "장애 고지"],
     "required_output": ["장애 상태 인지 및 고지", "일반 원칙 기반 잠정 답변", "인간 상담원 에스컬레이션 제안", "복구 후 재확인 안내"],
-    "prohibited_output": ["근거 없이 정상 데이터로 응답", "장애 사실 은폐", "존재하지 않는 CSV 내용을 지어내어 답변"]
+    "prohibited_output": ["근거 없이 정상 데이터로 응답", "장애 사실 은폐", "존재하지 않는 내용을 지어내어 답변"]
   }
 ]
